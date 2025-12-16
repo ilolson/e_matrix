@@ -87,7 +87,7 @@ int main(void) {
   getmaxyx(stdscr, rows, cols);
 
   // Particle count: tweak for density
-  int N = (rows * cols) / 12;
+  int N = (rows * cols) / 20;
   if (N < 200) N = 200;
   Particle *P = (Particle *)calloc((size_t)N, sizeof(Particle));
   if (!P) endwin(), exit(1);
