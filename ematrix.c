@@ -1,7 +1,4 @@
-// swirlmatrix.c
 // Build: gcc -O2 -Wall -Wextra ematrix.c -lncurses -lm -o ematrix
-// Run:   ./swirlmatrix
-//
 // Keys: q to quit
 
 #include <ncurses.h>
@@ -103,7 +100,7 @@ int main(void) {
   const float Y_MULT = 1.0f;       // vertical stretch
   const float SPEED = 1.35f;     // tweak swirl speed
   const float MIN_R = 3.0f;      // respawn when near center
-  const int   FPS_US = 8250;    // 120 fps
+  const int   FPS_US = 3280;    // 200 fps
 
   while (1) {
     int ch = getch();
