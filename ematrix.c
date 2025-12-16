@@ -56,7 +56,7 @@ static void respawn(Particle *p, int cols, int rows) {
   float cy = (rows - 1) * 0.5f;
 
   float maxr = fminf(cx, cy);
-  float r = frandf(maxr * 0.35f, maxr * 0.95f);
+  float r = frandf(maxr * 0.35f, maxr * 2.95f);
   float a = frandf(0.0f, 2.0f * (float)M_PI);
 
   p->vx0 = r * cosf(a);
