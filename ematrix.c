@@ -81,6 +81,17 @@ int main(void) {
     init_pair(1, COLOR_GREEN, -1);
     init_pair(2, COLOR_GREEN, -1);
     init_pair(3, COLOR_GREEN, -1);
+    // "Black hole" rainbow palette (fg on black bg)
+    // If the terminal supports 256 colors, use bright extended palette indices.
+    if (COLORS >= 256) {
+      // blue, cyan, green, yellow, orange, red, magenta, purple, white
+      short pal[] = {21, 51, 46, 226, 202, 196, 201, 93, 231};
+      for (int i = 0; i < 9; i++) init_pair((short)(20 + i), pal[i], COLOR_BLACK);
+    } else {
+      // fallback: basic colors (still rainbow-ish)
+      short pal[] = {COLOR_BLUE, COLOR_CYAN, COLOR_GREEN, COLOR_YELLOW, COLOR_RED, COLOR_MAGENTA, COLOR_WHITE};
+      for (int i = 0; i < 7; i++) init_pair((short)(10 + i), pal[i], COLOR_BLACK);
+    }
   }
 
   int rows, cols;
@@ -102,9 +113,16 @@ int main(void) {
   const float MIN_R = 3.0f;      // respawn when near center
   const int   FPS_US = 3280;    // 200 fps
 
+  // Black-hole palette layout (depends on terminal color support)
+  const int BH_PAIR_BASE  = (has_colors() && COLORS >= 256) ? 20 : 10;
+  const int BH_PAIR_COUNT = (has_colors() && COLORS >= 256) ? 9 : 7;
+
+  int bh_mode = 0; // toggled with 'R' : black-hole-like palette using velocity + radius
+
   while (1) {
     int ch = getch();
     if (ch == 'q' || ch == 'Q') break;
+    if (ch == 'r' || ch == 'R') bh_mode = !bh_mode;
 
     // Handle terminal resize
     int newr, newc;
@@ -117,6 +135,8 @@ int main(void) {
 
     float cx = (cols - 1) * 0.5f;
     float cy = (rows - 1) * 0.5f;
+    // Max visible radius in the *un-stretched* (vx,vy) space
+    float maxr_vis = fminf(cx / X_MULT, cy / Y_MULT);
 
     // Clear each frame (simple "cmatrix-like" refresh)
     erase();
@@ -145,14 +165,105 @@ int main(void) {
       // Occasionally mutate character for that "matrix" vibe
       if ((rand() % 28) == 0) P[i].ch = rand_char();
 
-      // Brightness based on age
-      float a = fminf(age / 2.0f, 1.0f);
+      // Color/brightness
       if (has_colors()) {
-        attron(COLOR_PAIR(1));
-        if (a > 0.66f) attron(A_BOLD);
-        mvaddch(y, x, P[i].ch);
-        if (a > 0.66f) attroff(A_BOLD);
-        attroff(COLOR_PAIR(1));
+        if (!bh_mode) {
+          // Original "matrix green" vibe
+          float a = fminf(age / 2.0f, 1.0f);
+          attron(COLOR_PAIR(1));
+          if (a > 0.66f) attron(A_BOLD);
+          mvaddch(y, x, P[i].ch);
+          if (a > 0.66f) attroff(A_BOLD);
+          attroff(COLOR_PAIR(1));
+        } else {
+          // "Black hole" vibe: use BOTH radius and local speed (velocity) for color
+          // Position in (vx,vy) space (pre-stretch)
+          float shadow_r = 0.18f * maxr_vis;
+          float ring_r   = 0.32f * maxr_vis;
+          float ring_w   = 0.06f * maxr_vis;
+
+          // Velocity w.r.t. real time: v_dot = SPEED * A * v
+          float ax = -vx - vy; // A*[vx;vy] x-component
+          float ay =  vx;      // A*[vx;vy] y-component
+          float speed = SPEED * sqrtf(ax * ax + ay * ay);
+
+          // "Swirl" ~ angular-ish speed (varies with direction, not just radius)
+          float swirl = speed / (r + 1e-3f);
+          float swirl_n = fminf(swirl / 2.0f, 1.0f);
+
+          // Heat: roughly how fast it's moving relative to the max visible radius
+          float heat = fminf(speed / (SPEED * (maxr_vis * 2.0f) + 1e-3f), 1.0f);
+
+          // Rainbow index (time + radius + velocity), so it isn't just "inward gradient"
+          float rr = fminf(r / (maxr_vis + 1e-3f), 1.0f);
+          float hue = fmodf(0.12f * tnow + 0.85f * swirl_n + 0.40f * rr + 0.15f * heat, 1.0f);
+          int rainbow_idx = (int)floorf(hue * (float)BH_PAIR_COUNT);
+          if (rainbow_idx < 0) rainbow_idx = 0;
+          if (rainbow_idx >= BH_PAIR_COUNT) rainbow_idx = BH_PAIR_COUNT - 1;
+          int rainbow_pair = BH_PAIR_BASE + rainbow_idx;
+
+          int pair = rainbow_pair;
+          int do_bold = 0;
+          int do_dim  = 0;
+          int do_blink = 0;
+          int draw_it = 1;
+
+          // Deep shadow: mostly empty/dim near the center
+          if (r < shadow_r) {
+            if ((rand() & 3) != 0) {
+              draw_it = 0; // skip most chars to make a darker "shadow"
+            } else {
+              pair = BH_PAIR_BASE;
+              do_dim = 1;
+            }
+          } else {
+            // Bright photon-ring-like band, thickness reacts to swirl
+            float ring_thick = ring_w * (0.6f + 0.8f * swirl_n);
+            if (fabsf(r - ring_r) < ring_thick) {
+              // Ring flashes between white-hot and rainbow depending on swirl/time
+              int white_pair = BH_PAIR_BASE + (BH_PAIR_COUNT - 1);
+              pair = (((int)(tnow * 14.0f) & 1) || swirl_n > 0.55f) ? white_pair : rainbow_pair;
+              do_bold = 1;
+              if (swirl_n > 0.75f) do_blink = 1;
+            } else {
+              // Disk color is rainbow_pair; intensity comes from velocity/"heat" and swirl
+              float t = 0.60f * heat + 0.40f * swirl_n;
+              pair = rainbow_pair;
+
+              // Make it "flashy": occasional sparkles for fast-moving bits
+              if (t > 0.85f) {
+                do_bold = 1;
+                if ((rand() % 10) == 0) {
+                  pair = BH_PAIR_BASE + (BH_PAIR_COUNT - 1); // white sparkle
+                  do_blink = 1;
+                }
+              } else if (t > 0.65f) {
+                do_bold = 1;
+              } else if (t < 0.25f) {
+                do_dim = 1;
+              }
+
+              // Rare global twinkle (keeps it lively)
+              if ((rand() & 127) == 0) {
+                pair = BH_PAIR_BASE + (BH_PAIR_COUNT - 1);
+                do_bold = 1;
+                do_blink = 1;
+              }
+            }
+          }
+
+          if (draw_it) {
+            attron(COLOR_PAIR(pair));
+            if (do_bold)  attron(A_BOLD);
+            if (do_dim)   attron(A_DIM);
+            if (do_blink) attron(A_BLINK);
+            mvaddch(y, x, P[i].ch);
+            if (do_blink) attroff(A_BLINK);
+            if (do_dim)   attroff(A_DIM);
+            if (do_bold)  attroff(A_BOLD);
+            attroff(COLOR_PAIR(pair));
+          }
+        }
       } else {
         mvaddch(y, x, P[i].ch);
       }
