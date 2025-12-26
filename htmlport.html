@@ -1,0 +1,377 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+  <title>ematrix (iPad)</title>
+  <style>
+    html, body {
+      margin: 0;
+      height: 100%;
+      background: #000;
+      overflow: hidden;
+      touch-action: none;
+      -webkit-user-select: none;
+      user-select: none;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+    }
+    canvas {
+      display: block;
+      width: 100vw;
+      height: 100vh;
+    }
+    /* Simple overlay controls for iPad/touch */
+    .hud {
+      position: fixed;
+      left: env(safe-area-inset-left);
+      right: env(safe-area-inset-right);
+      bottom: env(safe-area-inset-bottom);
+      padding: 12px;
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      justify-content: space-between;
+      pointer-events: none; /* allow canvas taps through except buttons */
+    }
+    .hud .btns {
+      display: flex;
+      gap: 10px;
+      pointer-events: auto;
+    }
+    button {
+      background: rgba(20,20,20,0.65);
+      color: #d9ffd9;
+      border: 1px solid rgba(120,255,120,0.25);
+      border-radius: 14px;
+      padding: 10px 12px;
+      font-size: 16px;
+      line-height: 1;
+      backdrop-filter: blur(8px);
+      -webkit-backdrop-filter: blur(8px);
+    }
+    button:active { transform: scale(0.98); }
+    .note {
+      pointer-events: none;
+      color: rgba(210,255,210,0.55);
+      font-size: 12px;
+      text-align: right;
+      max-width: 45vw;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="c"></canvas>
+
+  <div class="hud">
+    <div class="btns">
+      <button id="toggleR">Toggle R (Black Hole)</button>
+      <button id="toggleP">Pause</button>
+    </div>
+    <div class="note">
+      Keys: R = mode, P = pause<br/>
+      (On iPad, use buttons)
+    </div>
+  </div>
+
+<script>
+(() => {
+  // ---- Config (mirrors your C defaults) ----
+  const SCALE       = 0.76;
+  const RADIUS_MULT = 2.0;
+  const X_MULT      = 2.0;
+  const Y_MULT      = 1.0;
+  const SPEED       = 1.35;
+  const MIN_R       = 3.0;
+
+  // Character grid sizing in pixels:
+  // Smaller = denser, but more draw calls.
+  const CELL_W = 12;
+  const CELL_H = 16;
+
+  // Particle density similar to (rows*cols)/20 with min 200
+  const MIN_N = 200;
+  const DENSITY_DIV = 20;
+
+  // Character set
+  const SET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz@#$%&*+=-";
+
+  // ---- Canvas setup ----
+  const canvas = document.getElementById("c");
+  const ctx = canvas.getContext("2d", { alpha: false, desynchronized: true });
+
+  let dpr = 1;
+  let W = 0, H = 0;
+  let cols = 0, rows = 0;
+
+  // Particles
+  /** @type {{vx0:number, vy0:number, born:number, ch:string}[]} */
+  let P = [];
+  let N = 0;
+
+  // Modes
+  let bhMode = false;
+  let paused = false;
+
+  // Timing
+  const t0 = performance.now();
+  const nowSeconds = () => (performance.now() - t0) / 1000;
+
+  // Random helpers
+  const frandf = (a, b) => a + (b - a) * Math.random();
+  const randChar = () => SET[(Math.random() * SET.length) | 0];
+
+  // Analytic matrix exponential for A = [[-1,-1],[1,0]]
+  // exp(A t) = e^{-0.5 t} [ cos(w t) I + (sin(w t)/w) (A + 0.5 I) ]
+  // w = sqrt(3)/2
+  const w = 0.8660254037844386;
+  function expA(t) {
+    const et = Math.exp(-0.5 * t);
+    const c  = Math.cos(w * t);
+    const s  = Math.sin(w * t);
+    const k  = (Math.abs(w) < 1e-8) ? t : (s / w);
+
+    // B = A + 0.5 I = [[-0.5, -1],[1, 0.5]]
+    const B00 = -0.5, B01 = -1.0, B10 = 1.0, B11 = 0.5;
+
+    // M = et * ( c*I + k*B )
+    return {
+      m00: et * (c + k * B00),
+      m01: et * (    k * B01),
+      m10: et * (    k * B10),
+      m11: et * (c + k * B11),
+    };
+  }
+
+  function respawn(p) {
+    const cx = (cols - 1) * 0.5;
+    const cy = (rows - 1) * 0.5;
+    const maxr = Math.min(cx, cy);
+
+    const r = frandf(maxr * 0.35, maxr * 2.95);
+    const a = frandf(0, Math.PI * 2);
+
+    p.vx0 = r * Math.cos(a);
+    p.vy0 = r * Math.sin(a);
+    p.born = nowSeconds();
+    p.ch = randChar();
+  }
+
+  function resize() {
+    dpr = Math.max(1, Math.min(3, window.devicePixelRatio || 1));
+
+    W = Math.floor(window.innerWidth  * dpr);
+    H = Math.floor(window.innerHeight * dpr);
+
+    canvas.width = W;
+    canvas.height = H;
+
+    cols = Math.max(10, Math.floor(W / (CELL_W * dpr)) );
+    rows = Math.max(10, Math.floor(H / (CELL_H * dpr)) );
+
+    // We'll draw text in pixel space, but compute positions in "cell space".
+    // Precompute font scaled for dpr:
+    ctx.setTransform(1,0,0,1,0,0);
+    ctx.imageSmoothingEnabled = false;
+    ctx.textBaseline = "top";
+    ctx.font = `${Math.round(CELL_H * dpr)}px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace`;
+
+    // Recompute N and recreate particles
+    N = Math.max(MIN_N, Math.floor((rows * cols) / DENSITY_DIV));
+    P = new Array(N);
+    for (let i = 0; i < N; i++) {
+      P[i] = { vx0: 0, vy0: 0, born: 0, ch: "0" };
+      respawn(P[i]);
+    }
+  }
+
+  // Convert cell coords to pixel coords (top-left)
+  function cellToPx(x, y) {
+    // Scale cell size by dpr so it looks sharp
+    const px = Math.round(x * CELL_W * dpr);
+    const py = Math.round(y * CELL_H * dpr);
+    return [px, py];
+  }
+
+  // Color helpers
+  function greenByAge(age) {
+    // Similar "matrix" vibe: brighter as age grows a bit
+    const a = Math.min(age / 2.0, 1.0);
+    const g = 170 + Math.floor(85 * a);
+    return `rgb(0,${g},0)`;
+  }
+
+  // Black-hole rainbow-ish palette using HSL (fast, flexible)
+  function rainbowColor(h, light) {
+    // h in [0,1)
+    const hue = Math.floor(h * 360);
+    const l = Math.floor(light * 100);
+    return `hsl(${hue} 100% ${l}%)`;
+  }
+
+  // Buttons / keyboard
+  document.getElementById("toggleR").addEventListener("click", () => { bhMode = !bhMode; });
+  document.getElementById("toggleP").addEventListener("click", () => { paused = !paused; });
+
+  window.addEventListener("keydown", (e) => {
+    const k = (e.key || "").toLowerCase();
+    if (k === "r") bhMode = !bhMode;
+    if (k === "p") paused = !paused;
+  });
+
+  // iOS Safari sometimes needs a user gesture for best perf; tapping focuses interaction
+  window.addEventListener("pointerdown", () => {
+    // no-op; just ensures we get gesture context
+  }, { passive: true });
+
+  // Main loop (requestAnimationFrame -> will run up to 120Hz on 120Hz iPad screens)
+  let lastT = nowSeconds();
+
+  function frame() {
+    requestAnimationFrame(frame);
+
+    const tnow = nowSeconds();
+    const dt = tnow - lastT;
+    lastT = tnow;
+
+    if (paused) return;
+
+    // Clear frame (like your erase())
+    ctx.fillStyle = "black";
+    ctx.fillRect(0, 0, W, H);
+
+    const cx = (cols - 1) * 0.5;
+    const cy = (rows - 1) * 0.5;
+    const maxrVis = Math.min(cx / X_MULT, cy / Y_MULT);
+
+    // For a little “blink” effect without expensive timers
+    const blinkOn = ((tnow * 14) | 0) & 1;
+
+    for (let i = 0; i < N; i++) {
+      const p = P[i];
+      const age = (tnow - p.born) * SPEED;
+
+      const M = expA(age);
+
+      const vx = RADIUS_MULT * SCALE * (M.m00 * p.vx0 + M.m01 * p.vy0);
+      const vy = RADIUS_MULT * SCALE * (M.m10 * p.vx0 + M.m11 * p.vy0);
+
+      const sx = X_MULT * vx;
+      const sy = Y_MULT * vy;
+
+      const r = Math.hypot(vx, vy);
+
+      const xCell = Math.round(cx + sx);
+      const yCell = Math.round(cy + sy);
+
+      if (r < MIN_R || xCell < 0 || xCell >= cols || yCell < 0 || yCell >= rows) {
+        respawn(p);
+        continue;
+      }
+
+      // Occasional character mutation
+      if (((Math.random() * 28) | 0) === 0) p.ch = randChar();
+
+      // Determine draw style
+      let draw = true;
+      let fill = "#00cc00";
+      let alpha = 1.0;
+      let bold = false;
+
+      if (!bhMode) {
+        fill = greenByAge(age);
+        bold = (age / 2.0) > 0.66;
+        alpha = 1.0;
+      } else {
+        // Black-hole-ish shading, ring, rainbow based on velocity+radius+time
+        const shadowR = 0.18 * maxrVis;
+        const ringR   = 0.32 * maxrVis;
+        const ringW   = 0.06 * maxrVis;
+
+        // v_dot = SPEED * A * v  (A*[vx;vy] = [-vx - vy, vx])
+        const ax = -vx - vy;
+        const ay =  vx;
+        const speed = SPEED * Math.hypot(ax, ay);
+
+        const swirl = speed / (r + 1e-3);
+        const swirlN = Math.min(swirl / 2.0, 1.0);
+        const heat = Math.min(speed / (SPEED * (maxrVis * 2.0) + 1e-3), 1.0);
+
+        const rr = Math.min(r / (maxrVis + 1e-3), 1.0);
+        let hue = (0.12 * tnow + 0.85 * swirlN + 0.40 * rr + 0.15 * heat) % 1.0;
+        if (hue < 0) hue += 1.0;
+
+        // Shadow region: mostly empty/dim
+        if (r < shadowR) {
+          if ((Math.random() * 4) > 1) {
+            draw = false;
+          } else {
+            fill = rainbowColor(hue, 0.35);
+            alpha = 0.55;
+          }
+        } else {
+          // Ring thickness reacts to swirl
+          const ringThick = ringW * (0.6 + 0.8 * swirlN);
+          if (Math.abs(r - ringR) < ringThick) {
+            // Flash between white-hot and rainbow
+            fill = (blinkOn || swirlN > 0.55) ? "white" : rainbowColor(hue, 0.65);
+            bold = true;
+            alpha = 1.0;
+            // Faux blink: occasionally skip
+            if (swirlN > 0.75 && !blinkOn && Math.random() < 0.4) draw = false;
+          } else {
+            // Disk: rainbow with intensity from heat+swirl
+            const t = 0.60 * heat + 0.40 * swirlN;
+            fill = rainbowColor(hue, 0.50 + 0.25 * t);
+            alpha = 0.65 + 0.35 * t;
+
+            if (t > 0.65) bold = true;
+            if (t < 0.25) alpha *= 0.65;
+
+            // Occasional white sparkle for fast bits
+            if (t > 0.85 && Math.random() < 0.10) {
+              fill = "white";
+              bold = true;
+              alpha = 1.0;
+              if (!blinkOn) draw = false;
+            }
+
+            // Rare global twinkle
+            if (((Math.random() * 128) | 0) === 0) {
+              fill = "white";
+              bold = true;
+              alpha = 1.0;
+              if (!blinkOn) draw = false;
+            }
+          }
+        }
+      }
+
+      if (!draw) continue;
+
+      const [px, py] = cellToPx(xCell, yCell);
+
+      ctx.globalAlpha = alpha;
+      ctx.fillStyle = fill;
+
+      // Faux-bold: draw twice with a tiny offset when "bold"
+      if (bold) {
+        ctx.fillText(p.ch, px, py);
+        ctx.fillText(p.ch, px + Math.max(1, (dpr * 0.6) | 0), py);
+      } else {
+        ctx.fillText(p.ch, px, py);
+      }
+    }
+
+    ctx.globalAlpha = 1.0;
+  }
+
+  // Init
+  resize();
+  window.addEventListener("resize", resize);
+
+  // Start
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
